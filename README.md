@@ -2,27 +2,26 @@
 
 A local alarm clock that runs in the terminal. It uses Python 3.12 or newer and the standard library; alarms are stored in a JSON file.
 
-## Run from a checkout
+## Install and run
 
-Create and activate a virtual environment if desired, then run the module from the repository root:
+Install [uv](https://docs.astral.sh/uv/), then sync the project from the repository root. This creates the project environment, installs the package, and exposes the `alarm-clock` command:
 
 ```sh
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m alarm_clock --help
+uv sync
+uv run alarm-clock --help
 ```
 
-The default data file is `~/.alarm-clock/alarms.json`. Pass `--data-file PATH` before the command to use a different file.
+Use `uv add PACKAGE` to add a runtime dependency. The application currently has no runtime dependencies outside the Python standard library. The default data file is `~/.alarm-clock/alarms.json`. Pass `--data-file PATH` before the command to use a different file.
 
 ## Commands
 
 Create one-time and recurring alarms:
 
 ```sh
-python -m alarm_clock add 07:30 --label "Wake up"
-python -m alarm_clock add 08:00 --date 2026-11-20 --label "Appointment"
-python -m alarm_clock add 06:45 --repeat weekdays
-python -m alarm_clock add 09:00 --repeat custom --days mon,wed,fri --snooze 10
+uv run alarm-clock add 07:30 --label "Wake up"
+uv run alarm-clock add 08:00 --date 2026-11-20 --label "Appointment"
+uv run alarm-clock add 06:45 --repeat weekdays
+uv run alarm-clock add 09:00 --repeat custom --days mon,wed,fri --snooze 10
 ```
 
 One-time alarms without `--date` use the next local calendar date at that time. Recurring options are `daily`, `weekdays`, and `custom`; custom days use three-letter weekday names. Times use 24-hour `HH:MM` format.
@@ -30,17 +29,17 @@ One-time alarms without `--date` use the next local calendar date at that time. 
 Manage alarms with `list`, `update ID`, `enable ID`, `disable ID`, and `delete ID`:
 
 ```sh
-python -m alarm_clock list
-python -m alarm_clock update ALARM_ID --time 07:45 --label "Earlier"
-python -m alarm_clock update ALARM_ID --repeat custom --days tue,thu
-python -m alarm_clock disable ALARM_ID
-python -m alarm_clock delete ALARM_ID
+uv run alarm-clock list
+uv run alarm-clock update ALARM_ID --time 07:45 --label "Earlier"
+uv run alarm-clock update ALARM_ID --repeat custom --days tue,thu
+uv run alarm-clock disable ALARM_ID
+uv run alarm-clock delete ALARM_ID
 ```
 
 Run the scheduler in the foreground:
 
 ```sh
-python -m alarm_clock run
+uv run alarm-clock run
 ```
 
 When an alarm rings, enter `snooze ID` or `dismiss ID`. Snooze uses the alarm's configured duration. Enter `quit` or press Ctrl-C to stop monitoring. The scheduler reports missed alarms when it starts and does not play them overdue.
@@ -48,7 +47,7 @@ When an alarm rings, enter `snooze ID` or `dismiss ID`. Snooze uses the alarm's 
 To use a separate data file:
 
 ```sh
-python -m alarm_clock --data-file ./data/alarms.json add 07:30 --label "Wake up"
+uv run alarm-clock --data-file ./data/alarms.json add 07:30 --label "Wake up"
 ```
 
 ## Architecture
@@ -69,8 +68,8 @@ The terminal bell depends on terminal and system settings. There is no audio-fil
 
 ## Tests
 
-Run the standard-library test suite with:
+Run the test suite through the project environment with:
 
 ```sh
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
