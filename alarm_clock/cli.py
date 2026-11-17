@@ -1,6 +1,7 @@
 import argparse
 import re
 import sys
+from threading import Thread
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence, TextIO
@@ -177,14 +178,60 @@ def _update_alarm(service: AlarmService, args: argparse.Namespace, now: datetime
     return service.update(args.id, **changes)
 
 
+def _run_monitoring(
+    service: AlarmService,
+    output: TextIO,
+    errors: TextIO,
+    input_stream: TextIO,
+    clock,
+) -> None:
+    notifier = TerminalNotifier(output, clock)
+    scheduler = Scheduler(service, notifier.notify, clock=clock)
+    worker = Thread(target=scheduler.run_forever, name="alarm-scheduler")
+    print("Monitoring alarms. Enter 'dismiss <id>', 'snooze <id>', or 'quit'.", file=output, flush=True)
+    worker.start()
+    try:
+        while True:
+            line = input_stream.readline()
+            if not line:
+                break
+            parts = line.strip().split()
+            if not parts:
+                continue
+            command = parts[0].lower()
+            if command in {"quit", "exit"}:
+                break
+            if command not in {"dismiss", "snooze"} or len(parts) != 2:
+                print("Use 'dismiss <id>', 'snooze <id>', or 'quit'.", file=errors)
+                continue
+            alarm_id = parts[1]
+            try:
+                if command == "dismiss":
+                    alarm = service.dismiss(alarm_id)
+                    print(f"Dismissed alarm {alarm_id}.", file=output)
+                else:
+                    snoozed_until = service.snooze(alarm_id, now=clock())
+                    print(f"Snoozed alarm {alarm_id} until {snoozed_until:%Y-%m-%d %H:%M}.", file=output)
+            except (ValueError, LookupError) as error:
+                print(f"error: {error}", file=errors)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        scheduler.stop()
+        worker.join()
+    print("Alarm monitoring stopped.", file=output)
+
+
 def main(
     argv: Sequence[str] | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
+    stdin: TextIO | None = None,
     clock=datetime.now,
 ) -> int:
     output = stdout if stdout is not None else sys.stdout
     errors = stderr if stderr is not None else sys.stderr
+    input_stream = stdin if stdin is not None else sys.stdin
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -223,13 +270,7 @@ def main(
             service.disable(args.id)
             print(f"Disabled alarm {args.id}.", file=output)
         elif args.command == "run":
-            scheduler = Scheduler(service, TerminalNotifier(output, clock).notify, clock=clock)
-            print("Monitoring alarms. Press Ctrl-C to stop.", file=output)
-            try:
-                scheduler.run_forever()
-            except KeyboardInterrupt:
-                scheduler.stop()
-            print("Alarm monitoring stopped.", file=output)
+            _run_monitoring(service, output, errors, input_stream, clock)
         return 0
     except (ValueError, LookupError, StorageError, OSError) as error:
         print(f"error: {error}", file=errors)

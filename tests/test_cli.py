@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import tempfile
+from threading import Event
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,32 @@ class CliTests(unittest.TestCase):
             ["--data-file", str(self.data_file), *args],
             stdout=output,
             stderr=errors,
+            clock=self.now,
+        )
+        return result, output.getvalue(), errors.getvalue()
+
+    def run_cli_with_trigger_input(self, *args: str) -> tuple[int, str, str]:
+        triggered = Event()
+
+        class TriggerOutput(io.StringIO):
+            def write(self, value: str) -> int:
+                if "is ringing at" in value:
+                    triggered.set()
+                return super().write(value)
+
+        class TriggerInput(io.StringIO):
+            def readline(self, size: int = -1) -> str:
+                if not triggered.wait(2):
+                    return ""
+                return super().readline(size)
+
+        output = TriggerOutput()
+        errors = io.StringIO()
+        result = main(
+            ["--data-file", str(self.data_file), *args],
+            stdout=output,
+            stderr=errors,
+            stdin=TriggerInput("\n".join(self.commands) + "\n"),
             clock=self.now,
         )
         return result, output.getvalue(), errors.getvalue()
@@ -92,6 +119,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         for command in ("add", "list", "update", "delete", "enable", "disable", "run"):
             self.assertIn(command, output.getvalue())
+
+    def test_run_accepts_dismiss_for_a_ringing_one_time_alarm(self) -> None:
+        self.run_cli("add", "07:30", "--date", "2026-11-17")
+        alarm_id = json.loads(self.data_file.read_text(encoding="utf-8"))["alarms"][0]["id"]
+        self.commands = [f"dismiss {alarm_id}", "quit"]
+
+        code, output, errors = self.run_cli_with_trigger_input("run")
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"Alarm {alarm_id} is ringing", output)
+        self.assertIn(f"Dismissed alarm {alarm_id}", output)
+        self.assertEqual(errors, "")
+        self.assertFalse(json.loads(self.data_file.read_text(encoding="utf-8"))["alarms"][0]["enabled"])
+
+    def test_run_accepts_snooze_for_a_ringing_alarm(self) -> None:
+        self.run_cli("add", "07:30", "--date", "2026-11-17", "--snooze", "2")
+        alarm_id = json.loads(self.data_file.read_text(encoding="utf-8"))["alarms"][0]["id"]
+        self.commands = [f"snooze {alarm_id}", "quit"]
+
+        code, output, errors = self.run_cli_with_trigger_input("run")
+
+        self.assertEqual(code, 0)
+        self.assertIn(f"Snoozed alarm {alarm_id} until 2026-11-17 07:32", output)
+        self.assertEqual(errors, "")
 
 
 if __name__ == "__main__":
