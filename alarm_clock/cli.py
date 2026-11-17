@@ -185,6 +185,13 @@ def _run_monitoring(
     input_stream: TextIO,
     clock,
 ) -> None:
+    for missed in service.recover_missed(clock()):
+        label = f" ({missed.alarm.label})" if missed.alarm.label else ""
+        print(
+            f"Missed alarm {missed.alarm.id}{label} scheduled for "
+            f"{missed.scheduled_at:%Y-%m-%d %H:%M}: {missed.reason}.",
+            file=output,
+        )
     notifier = TerminalNotifier(output, clock)
     scheduler = Scheduler(service, notifier.notify, clock=clock)
     worker = Thread(target=scheduler.run_forever, name="alarm-scheduler")

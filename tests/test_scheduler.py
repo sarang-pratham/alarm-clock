@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from threading import Event, Thread
 
 from alarm_clock.models import Alarm, Recurrence, RecurrenceKind
 from alarm_clock.scheduler import Scheduler, next_occurrence
@@ -46,8 +47,8 @@ class NextOccurrenceTests(unittest.TestCase):
 class SchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        store = JsonAlarmStore(Path(self.temporary_directory.name) / "alarms.json")
-        self.service = AlarmService(store)
+        self.store = JsonAlarmStore(Path(self.temporary_directory.name) / "alarms.json")
+        self.service = AlarmService(self.store)
         self.now = [datetime(2026, 11, 18, 7, 0)]
         self.triggered: list[Alarm] = []
 
@@ -170,8 +171,50 @@ class SchedulerTests(unittest.TestCase):
 
         scheduler = self.make_scheduler(failing_callback)
 
-        self.assertEqual(scheduler.run_pending(), [first, second])
+        with self.assertLogs("alarm_clock.scheduler", level="ERROR"):
+            triggered = scheduler.run_pending()
+
+        self.assertEqual(triggered, [first, second])
         self.assertEqual(self.triggered, [second])
+
+    def test_snooze_is_restored_after_service_restart(self) -> None:
+        alarm = self.make_alarm("wake", time(7, 1))
+        self.service.create(alarm)
+        scheduler = self.make_scheduler()
+        self.now[0] = datetime(2026, 11, 18, 7, 1)
+        scheduler.run_pending()
+        snoozed_until = self.service.snooze(alarm.id, datetime(2026, 11, 18, 7, 2))
+
+        restarted_service = AlarmService(self.store)
+        restarted_scheduler = Scheduler(
+            restarted_service,
+            self.triggered.append,
+            clock=lambda: self.now[0],
+        )
+
+        self.assertEqual(restarted_scheduler.next_upcoming().at, snoozed_until)
+        self.now[0] = snoozed_until
+        restarted_scheduler.refresh()
+        self.assertEqual(restarted_scheduler.run_pending(), [alarm])
+
+    def test_dismissed_occurrence_is_not_repeated_after_restart_and_clock_reversal(self) -> None:
+        alarm = Alarm(
+            id="daily",
+            scheduled_time=time(7, 0),
+            recurrence=Recurrence(RecurrenceKind.DAILY),
+        )
+        self.service.create(alarm)
+        scheduler = self.make_scheduler()
+        self.now[0] = datetime(2026, 11, 18, 7, 0)
+        self.assertEqual(scheduler.run_pending(), [alarm])
+        self.service.dismiss(alarm.id)
+
+        self.now[0] = datetime(2026, 11, 18, 6, 30)
+        restarted_service = AlarmService(self.store)
+        restarted_scheduler = Scheduler(restarted_service, self.triggered.append, clock=lambda: self.now[0])
+
+        self.assertEqual(restarted_scheduler.next_upcoming().at, datetime(2026, 11, 19, 7, 0))
+        self.assertEqual(restarted_scheduler.run_pending(), [])
 
     def test_stop_from_trigger_callback_shuts_down_run_loop(self) -> None:
         alarm = self.make_alarm("now", time(7, 0))
@@ -189,6 +232,68 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertTrue(scheduler._stop_event.is_set())
         self.assertEqual(self.triggered, [alarm])
+
+    def test_stop_before_run_prevents_run_loop_start(self) -> None:
+        scheduler = self.make_scheduler()
+
+        scheduler.stop()
+        scheduler.run_forever()
+
+        self.assertTrue(scheduler._stop_event.is_set())
+
+    def test_stop_interrupts_scheduler_wait(self) -> None:
+        alarm = self.make_alarm("later", time(8, 0))
+        self.service.create(alarm)
+        scheduler = self.make_scheduler()
+        waiting = Event()
+        original_wait = scheduler._wake_event.wait
+
+        def tracked_wait(timeout=None):
+            waiting.set()
+            return original_wait(timeout)
+
+        scheduler._wake_event.wait = tracked_wait
+        worker = Thread(target=scheduler.run_forever)
+        worker.start()
+
+        self.assertTrue(waiting.wait(2))
+        scheduler.stop()
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+
+    def test_configuration_change_wakes_and_rebuilds_scheduler_wait(self) -> None:
+        existing = self.make_alarm("later", time(8, 0))
+        self.service.create(existing)
+        scheduler = self.make_scheduler()
+        waiting = Event()
+        refreshed = Event()
+        original_wait = scheduler._wake_event.wait
+        original_refresh = scheduler.refresh
+
+        def tracked_wait(timeout=None):
+            waiting.set()
+            return original_wait(timeout)
+
+        def tracked_refresh():
+            original_refresh()
+            refreshed.set()
+
+        scheduler._wake_event.wait = tracked_wait
+        scheduler.refresh = tracked_refresh
+        worker = Thread(target=scheduler.run_forever)
+        worker.start()
+        self.assertTrue(waiting.wait(2))
+        refreshed.clear()
+
+        earlier = self.make_alarm("earlier", time(7, 30))
+        self.service.create(earlier)
+
+        self.assertTrue(refreshed.wait(2))
+        self.assertEqual(scheduler._occurrences[earlier.id].at, datetime(2026, 11, 18, 7, 30))
+        scheduler.stop()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
 
     def test_wait_timeout_is_bounded_for_clock_change_checks(self) -> None:
         alarm = self.make_alarm("later", time(8, 0))

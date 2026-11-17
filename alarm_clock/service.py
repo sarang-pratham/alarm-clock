@@ -4,6 +4,7 @@ from enum import StrEnum
 from typing import Callable
 
 from .models import Alarm, RecurrenceKind
+from .schedule import previous_occurrence
 from .storage import JsonAlarmStore
 
 
@@ -18,6 +19,8 @@ class AlarmAlreadyExistsError(ValueError):
 class OccurrenceState(StrEnum):
     RINGING = "ringing"
     SNOOZED = "snoozed"
+    DISMISSED = "dismissed"
+    MISSED = "missed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,13 +31,22 @@ class AlarmRuntime:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state", OccurrenceState(self.state))
+        if not isinstance(self.scheduled_at, datetime):
+            raise ValueError("scheduled_at must be a datetime")
         if self.scheduled_at.tzinfo is not None:
             raise ValueError("scheduled_at must use local time without a timezone")
         if self.state is OccurrenceState.SNOOZED:
-            if self.snoozed_until is None or self.snoozed_until.tzinfo is not None:
+            if not isinstance(self.snoozed_until, datetime) or self.snoozed_until.tzinfo is not None:
                 raise ValueError("snoozed occurrences require a local snoozed_until time")
         elif self.snoozed_until is not None:
             raise ValueError("snoozed_until is only valid for snoozed occurrences")
+
+
+@dataclass(frozen=True, slots=True)
+class MissedAlarm:
+    alarm: Alarm
+    scheduled_at: datetime
+    reason: str
 
 
 class AlarmService:
@@ -51,7 +63,7 @@ class AlarmService:
         self._store = store
         self._on_change = on_change
         self._alarms = {alarm.id: alarm for alarm in store.load()}
-        self._runtime: dict[str, AlarmRuntime] = {}
+        self._runtime = store.load_runtime()
 
     def list_alarms(self) -> list[Alarm]:
         return sorted(
@@ -119,43 +131,98 @@ class AlarmService:
 
     def mark_ringing(self, alarm_id: str, scheduled_at: datetime) -> None:
         self.get(alarm_id)
-        self._runtime[alarm_id] = AlarmRuntime(OccurrenceState.RINGING, scheduled_at)
+        runtime = dict(self._runtime)
+        runtime[alarm_id] = AlarmRuntime(OccurrenceState.RINGING, scheduled_at)
+        self._store.save(self._alarms.values(), runtime)
+        self._runtime = runtime
 
     def snooze(self, alarm_id: str, now: datetime | None = None) -> datetime:
         alarm = self.get(alarm_id)
         runtime = self._runtime.get(alarm_id)
-        if runtime is None:
+        if runtime is None or runtime.state not in {OccurrenceState.RINGING, OccurrenceState.SNOOZED}:
             raise ValueError(f"alarm {alarm_id!r} is not ringing")
         if now is None:
             now = datetime.now()
         if now.tzinfo is not None:
             raise ValueError("snooze clock must return a local datetime without a timezone")
         snoozed_until = now + timedelta(minutes=alarm.snooze_minutes)
-        self._runtime[alarm_id] = AlarmRuntime(
+        runtime_state = dict(self._runtime)
+        runtime_state[alarm_id] = AlarmRuntime(
             OccurrenceState.SNOOZED,
             runtime.scheduled_at,
             snoozed_until,
         )
+        self._store.save(self._alarms.values(), runtime_state)
+        self._runtime = runtime_state
         self._notify_change()
         return snoozed_until
 
     def dismiss(self, alarm_id: str) -> Alarm:
         alarm = self.get(alarm_id)
-        if alarm_id not in self._runtime:
+        runtime = self._runtime.get(alarm_id)
+        if runtime is None or runtime.state not in {OccurrenceState.RINGING, OccurrenceState.SNOOZED}:
             raise ValueError(f"alarm {alarm_id!r} is not ringing")
+        runtime_state = dict(self._runtime)
+        runtime_state[alarm_id] = AlarmRuntime(OccurrenceState.DISMISSED, runtime.scheduled_at)
         if alarm.recurrence.kind is RecurrenceKind.ONCE:
-            self.update(alarm_id, enabled=False)
-            return self.get(alarm_id)
-        self._runtime.pop(alarm_id, None)
+            updated = replace(alarm, enabled=False)
+            alarms = dict(self._alarms)
+            alarms[alarm_id] = updated
+            self._save_and_replace(alarms, runtime_state)
+        else:
+            self._store.save(self._alarms.values(), runtime_state)
+            self._runtime = runtime_state
         self._notify_change()
-        return alarm
+        return self.get(alarm_id)
+
+    def recover_missed(self, now: datetime) -> list[MissedAlarm]:
+        if now.tzinfo is not None:
+            raise ValueError("startup clock must return a local datetime without a timezone")
+        alarms = dict(self._alarms)
+        runtime_state = dict(self._runtime)
+        missed: list[MissedAlarm] = []
+        for alarm in self.list_alarms():
+            if not alarm.enabled:
+                continue
+            runtime = runtime_state.get(alarm.id)
+            previous = previous_occurrence(alarm, now)
+            missed_at: datetime | None = None
+            reason = "scheduled occurrence"
+
+            if runtime is not None and runtime.state is OccurrenceState.RINGING:
+                missed_at = previous if previous is not None and previous > runtime.scheduled_at else runtime.scheduled_at
+                reason = "was ringing when the application last stopped"
+            elif runtime is not None and runtime.state is OccurrenceState.SNOOZED:
+                if runtime.snoozed_until is not None and runtime.snoozed_until <= now:
+                    missed_at = (
+                        previous
+                        if previous is not None and previous > runtime.snoozed_until
+                        else runtime.snoozed_until
+                    )
+                    reason = "snooze expired while the application was stopped"
+                else:
+                    continue
+            elif previous is not None and (runtime is None or previous > runtime.scheduled_at):
+                missed_at = previous
+
+            if missed_at is None:
+                continue
+            missed.append(MissedAlarm(alarm, missed_at, reason))
+            runtime_state[alarm.id] = AlarmRuntime(OccurrenceState.MISSED, missed_at)
+            if alarm.recurrence.kind is RecurrenceKind.ONCE:
+                alarms[alarm.id] = replace(alarm, enabled=False)
+
+        if runtime_state != self._runtime or alarms != self._alarms:
+            self._save_and_replace(alarms, runtime_state)
+            self._notify_change()
+        return missed
 
     def _save_and_replace(
         self,
         updated: dict[str, Alarm],
         runtime: dict[str, AlarmRuntime] | None = None,
     ) -> None:
-        self._store.save(updated.values())
+        self._store.save(updated.values(), runtime)
         self._alarms = updated
         if runtime is not None:
             self._runtime = runtime

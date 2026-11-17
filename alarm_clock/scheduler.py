@@ -1,42 +1,20 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
 from threading import Event
 from typing import Callable
 
 from .models import Alarm, RecurrenceKind
+from .schedule import next_occurrence
 from .service import AlarmNotFoundError, AlarmService, OccurrenceState
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class ScheduledOccurrence:
     alarm: Alarm
     at: datetime
-
-
-def next_occurrence(alarm: Alarm, after: datetime) -> datetime | None:
-    if after.tzinfo is not None:
-        raise ValueError("scheduler clock must return a local datetime without a timezone")
-
-    if alarm.recurrence.kind is RecurrenceKind.ONCE:
-        if alarm.scheduled_date is None:
-            return None
-        occurrence = datetime.combine(alarm.scheduled_date, alarm.scheduled_time)
-        return occurrence if occurrence >= after else None
-
-    for offset in range(8):
-        day = after.date() + timedelta(days=offset)
-        if alarm.recurrence.kind is RecurrenceKind.DAILY:
-            matches = True
-        elif alarm.recurrence.kind is RecurrenceKind.WEEKDAYS:
-            matches = day.weekday() < 5
-        else:
-            matches = day.weekday() in alarm.recurrence.days
-        if not matches:
-            continue
-        occurrence = datetime.combine(day, alarm.scheduled_time)
-        if occurrence >= after:
-            return occurrence
-    return None
 
 
 class Scheduler:
@@ -76,6 +54,8 @@ class Scheduler:
             if not alarm.enabled:
                 continue
             runtime = self._service.runtime_for(alarm.id)
+            if runtime is not None:
+                self._fired.add((alarm.id, runtime.scheduled_at))
             if runtime is not None and runtime.state is OccurrenceState.SNOOZED:
                 if runtime.snoozed_until is not None:
                     occurrences[alarm.id] = ScheduledOccurrence(alarm, runtime.snoozed_until)
@@ -122,11 +102,14 @@ class Scheduler:
             self._fired.add((item.alarm.id, item.at))
             runtime = self._service.runtime_for(current.id)
             scheduled_at = runtime.scheduled_at if runtime is not None else item.at
-            self._service.mark_ringing(current.id, scheduled_at)
+            try:
+                self._service.mark_ringing(current.id, scheduled_at)
+            except Exception:
+                logger.exception("could not persist ringing state for alarm %s", current.id)
             try:
                 self._on_trigger(current)
             except Exception:
-                pass
+                logger.exception("notification failed for alarm %s", current.id)
             triggered.append(current)
 
             if current.recurrence.kind is not RecurrenceKind.ONCE:
@@ -154,7 +137,8 @@ class Scheduler:
         return self._next_unfired_occurrence(alarm, now)
 
     def run_forever(self) -> None:
-        self._stop_event.clear()
+        if self._stop_event.is_set():
+            return
         self.refresh()
         while not self._stop_event.is_set():
             self.run_pending()

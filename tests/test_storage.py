@@ -6,6 +6,7 @@ from pathlib import Path
 
 from alarm_clock.models import Alarm, Recurrence, RecurrenceKind
 from alarm_clock.storage import JsonAlarmStore, StorageError
+from alarm_clock.service import AlarmRuntime, OccurrenceState
 
 
 class JsonAlarmStoreTests(unittest.TestCase):
@@ -72,6 +73,33 @@ class JsonAlarmStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(StorageError, "duplicate alarm id"):
             self.store.save([first, second])
         self.assertFalse(self.path.exists())
+
+    def test_runtime_state_survives_store_reload(self) -> None:
+        alarm = Alarm(id="active", scheduled_time=time(7, 0), scheduled_date=date(2026, 11, 20))
+        runtime = AlarmRuntime(
+            OccurrenceState.SNOOZED,
+            datetime(2026, 11, 20, 7, 0),
+            datetime(2026, 11, 20, 7, 5),
+        )
+
+        self.store.save([alarm], {alarm.id: runtime})
+
+        self.assertEqual(self.store.load_runtime(), {alarm.id: runtime})
+
+    def test_corrupt_runtime_state_is_rejected_and_not_overwritten(self) -> None:
+        alarm = Alarm(id="active", scheduled_time=time(7, 0), scheduled_date=date(2026, 11, 20))
+        self.store.save([alarm])
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        payload["runtime"] = {alarm.id: {"state": "not-a-state"}}
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        original = self.path.read_text(encoding="utf-8")
+
+        with self.assertRaisesRegex(StorageError, "invalid runtime state"):
+            self.store.load_runtime()
+        with self.assertRaises(StorageError):
+            self.store.save([alarm])
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), original)
 
 
 if __name__ == "__main__":

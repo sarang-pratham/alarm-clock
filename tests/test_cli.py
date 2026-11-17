@@ -19,13 +19,14 @@ class CliTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def run_cli(self, *args: str) -> tuple[int, str, str]:
+    def run_cli(self, *args: str, stdin: io.StringIO | None = None) -> tuple[int, str, str]:
         output = io.StringIO()
         errors = io.StringIO()
         result = main(
             ["--data-file", str(self.data_file), *args],
             stdout=output,
             stderr=errors,
+            stdin=stdin,
             clock=self.now,
         )
         return result, output.getvalue(), errors.getvalue()
@@ -142,6 +143,17 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn(f"Snoozed alarm {alarm_id} until 2026-11-17 07:32", output)
+        self.assertEqual(errors, "")
+
+    def test_run_reports_missed_alarms_without_ringing_them(self) -> None:
+        self.run_cli("add", "07:00", "--date", "2026-11-16", "--label", "Old alarm")
+
+        code, output, errors = self.run_cli("run", stdin=io.StringIO("quit\n"))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Missed alarm", output)
+        self.assertIn("Old alarm", output)
+        self.assertNotIn("is ringing", output)
         self.assertEqual(errors, "")
 
 

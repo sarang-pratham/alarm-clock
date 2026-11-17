@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import json
 import os
 import tempfile
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 from .models import Alarm, Recurrence, RecurrenceKind
+
+if TYPE_CHECKING:
+    from .service import AlarmRuntime
 
 
 class StorageError(Exception):
@@ -19,16 +24,9 @@ class JsonAlarmStore:
         self.path = Path(path)
 
     def load(self) -> list[Alarm]:
-        try:
-            with self.path.open("r", encoding="utf-8") as stream:
-                payload = json.load(stream)
-        except FileNotFoundError:
+        payload = self._read_payload()
+        if payload is None:
             return []
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise StorageError(f"could not read alarm storage at {self.path}: {error}") from error
-
-        if not isinstance(payload, dict) or payload.get("version") != self.version:
-            raise StorageError(f"alarm storage at {self.path} has an unsupported format")
         records = payload.get("alarms")
         if not isinstance(records, list):
             raise StorageError(f"alarm storage at {self.path} must contain an alarms list")
@@ -46,7 +44,29 @@ class JsonAlarmStore:
             alarms.append(alarm)
         return alarms
 
-    def save(self, alarms: Iterable[Alarm]) -> None:
+    def load_runtime(self) -> dict[str, AlarmRuntime]:
+        payload = self._read_payload()
+        if payload is None:
+            return {}
+        records = payload.get("runtime", {})
+        if not isinstance(records, dict):
+            raise StorageError(f"alarm storage at {self.path} must contain an object for runtime state")
+        alarm_ids = {alarm.id for alarm in self.load()}
+        runtime: dict[str, AlarmRuntime] = {}
+        for alarm_id, record in records.items():
+            if not isinstance(alarm_id, str) or alarm_id not in alarm_ids:
+                raise StorageError(f"runtime state references unknown alarm id {alarm_id!r} in {self.path}")
+            try:
+                runtime[alarm_id] = self._deserialize_runtime(record)
+            except (KeyError, TypeError, ValueError) as error:
+                raise StorageError(f"invalid runtime state for alarm {alarm_id!r} in {self.path}: {error}") from error
+        return runtime
+
+    def save(
+        self,
+        alarms: Iterable[Alarm],
+        runtime: Mapping[str, AlarmRuntime] | None = None,
+    ) -> None:
         alarm_list = list(alarms)
         ids: set[str] = set()
         for alarm in alarm_list:
@@ -57,11 +77,43 @@ class JsonAlarmStore:
             ids.add(alarm.id)
 
         self.load()
+        existing_runtime = self.load_runtime()
+        if runtime is None:
+            runtime_records = {alarm_id: state for alarm_id, state in existing_runtime.items() if alarm_id in ids}
+        else:
+            runtime_records = dict(runtime)
+        for alarm_id, state in runtime_records.items():
+            if alarm_id not in ids:
+                raise StorageError(f"runtime state references unknown alarm id {alarm_id!r}")
+            if not isinstance(state, self._runtime_type()):
+                raise StorageError("runtime values must be AlarmRuntime instances")
         payload = {
             "version": self.version,
             "alarms": [self._serialize_alarm(alarm) for alarm in alarm_list],
+            "runtime": {
+                alarm_id: self._serialize_runtime(state)
+                for alarm_id, state in runtime_records.items()
+            },
         }
+        self._write_payload(payload)
 
+    def save_runtime(self, runtime: Mapping[str, AlarmRuntime]) -> None:
+        self.save(self.load(), runtime)
+
+    def _read_payload(self) -> dict[str, object] | None:
+        try:
+            with self.path.open("r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise StorageError(f"could not read alarm storage at {self.path}: {error}") from error
+
+        if not isinstance(payload, dict) or payload.get("version") != self.version:
+            raise StorageError(f"alarm storage at {self.path} has an unsupported format")
+        return payload
+
+    def _write_payload(self, payload: dict[str, object]) -> None:
         temporary_path: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,4 +176,35 @@ class JsonAlarmStore:
             snooze_minutes=record["snooze_minutes"],
             scheduled_date=scheduled_date,
             created_at=datetime.fromisoformat(record["created_at"]),
+        )
+
+    @staticmethod
+    def _runtime_type() -> type[AlarmRuntime]:
+        from .service import AlarmRuntime
+
+        return AlarmRuntime
+
+    @staticmethod
+    def _serialize_runtime(runtime: AlarmRuntime) -> dict[str, str | None]:
+        return {
+            "state": runtime.state.value,
+            "scheduled_at": runtime.scheduled_at.isoformat(),
+            "snoozed_until": runtime.snoozed_until.isoformat() if runtime.snoozed_until else None,
+        }
+
+    @staticmethod
+    def _deserialize_runtime(record: object) -> AlarmRuntime:
+        if not isinstance(record, dict):
+            raise ValueError("runtime value must be an object")
+        from .service import AlarmRuntime, OccurrenceState
+
+        snoozed_until_value = record["snoozed_until"]
+        return AlarmRuntime(
+            state=OccurrenceState(record["state"]),
+            scheduled_at=datetime.fromisoformat(record["scheduled_at"]),
+            snoozed_until=(
+                datetime.fromisoformat(snoozed_until_value)
+                if snoozed_until_value is not None
+                else None
+            ),
         )

@@ -158,7 +158,7 @@ class AlarmServiceTests(unittest.TestCase):
         dismissed_once = self.service.dismiss(self.alarm.id)
 
         self.assertFalse(dismissed_once.enabled)
-        self.assertIsNone(self.service.runtime_for(self.alarm.id))
+        self.assertEqual(self.service.runtime_for(self.alarm.id).state, OccurrenceState.DISMISSED)
         self.assertEqual(self.store.load(), [dismissed_once])
 
         recurring = Alarm(
@@ -172,7 +172,59 @@ class AlarmServiceTests(unittest.TestCase):
 
         self.assertTrue(dismissed_recurring.enabled)
         self.assertEqual(self.service.get(recurring.id), recurring)
-        self.assertIsNone(self.service.runtime_for(recurring.id))
+        self.assertEqual(self.service.runtime_for(recurring.id).state, OccurrenceState.DISMISSED)
+
+    def test_startup_reports_and_persists_missed_one_time_alarm_once(self) -> None:
+        missed_alarm = Alarm(
+            id="missed",
+            scheduled_time=time(7, 0),
+            scheduled_date=date(2026, 11, 17),
+        )
+        self.service.create(missed_alarm)
+        now = datetime(2026, 11, 18, 8, 0)
+
+        missed = self.service.recover_missed(now)
+
+        self.assertEqual(len(missed), 1)
+        self.assertEqual(missed[0].scheduled_at, datetime(2026, 11, 17, 7, 0))
+        self.assertFalse(self.service.get(missed_alarm.id).enabled)
+        restarted = AlarmService(self.store)
+        self.assertEqual(restarted.recover_missed(now), [])
+
+    def test_startup_marks_interrupted_ring_as_missed(self) -> None:
+        recurring = Alarm(
+            id="daily",
+            scheduled_time=time(7, 0),
+            recurrence=Recurrence(RecurrenceKind.DAILY),
+        )
+        self.service.create(recurring)
+        ringing_at = datetime(2026, 11, 17, 7, 0)
+        self.service.mark_ringing(recurring.id, ringing_at)
+        restarted = AlarmService(self.store)
+
+        missed = restarted.recover_missed(datetime(2026, 11, 18, 8, 0))
+
+        self.assertEqual(len(missed), 1)
+        self.assertIn("was ringing", missed[0].reason)
+        self.assertEqual(restarted.runtime_for(recurring.id).state, OccurrenceState.MISSED)
+        self.assertEqual(restarted.recover_missed(datetime(2026, 11, 18, 8, 0)), [])
+
+    def test_startup_preserves_future_snooze_and_reports_expired_snooze(self) -> None:
+        recurring = Alarm(
+            id="daily",
+            scheduled_time=time(7, 0),
+            recurrence=Recurrence(RecurrenceKind.DAILY),
+        )
+        self.service.create(recurring)
+        self.service.mark_ringing(recurring.id, datetime(2026, 11, 18, 7, 0))
+        self.service.snooze(recurring.id, datetime(2026, 11, 18, 7, 1))
+        restarted = AlarmService(self.store)
+
+        self.assertEqual(restarted.recover_missed(datetime(2026, 11, 18, 7, 3)), [])
+        missed = restarted.recover_missed(datetime(2026, 11, 18, 7, 10))
+
+        self.assertEqual(len(missed), 1)
+        self.assertIn("snooze expired", missed[0].reason)
 
 
 if __name__ == "__main__":
