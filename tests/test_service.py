@@ -1,10 +1,15 @@
 import tempfile
 import unittest
-from datetime import date, time
+from datetime import date, datetime, time
 from pathlib import Path
 
 from alarm_clock.models import Alarm, Recurrence, RecurrenceKind
-from alarm_clock.service import AlarmAlreadyExistsError, AlarmNotFoundError, AlarmService
+from alarm_clock.service import (
+    AlarmAlreadyExistsError,
+    AlarmNotFoundError,
+    AlarmService,
+    OccurrenceState,
+)
 from alarm_clock.storage import JsonAlarmStore, StorageError
 
 
@@ -123,6 +128,51 @@ class AlarmServiceTests(unittest.TestCase):
         self.service.create(self.alarm)
 
         self.assertEqual([alarm.id for alarm in self.service.list_alarms()], ["wake-up", "later"])
+
+    def test_snooze_preserves_alarm_identity_and_can_be_repeated(self) -> None:
+        self.service.create(self.alarm)
+        occurrence = datetime(2026, 11, 18, 7, 30)
+        self.service.mark_ringing(self.alarm.id, occurrence)
+
+        first = self.service.snooze(self.alarm.id, datetime(2026, 11, 18, 7, 31))
+        runtime = self.service.runtime_for(self.alarm.id)
+        self.assertEqual(first, datetime(2026, 11, 18, 7, 36))
+        self.assertEqual(runtime.state, OccurrenceState.SNOOZED)
+        self.assertEqual(runtime.scheduled_at, occurrence)
+
+        second = self.service.snooze(self.alarm.id, datetime(2026, 11, 18, 7, 35))
+        runtime = self.service.runtime_for(self.alarm.id)
+        self.assertEqual(second, datetime(2026, 11, 18, 7, 40))
+        self.assertEqual(runtime.scheduled_at, occurrence)
+
+    def test_snooze_requires_a_ringing_alarm(self) -> None:
+        self.service.create(self.alarm)
+
+        with self.assertRaisesRegex(ValueError, "not ringing"):
+            self.service.snooze(self.alarm.id, datetime(2026, 11, 18, 7, 31))
+
+    def test_dismiss_disables_one_time_and_keeps_recurring_alarms_configured(self) -> None:
+        self.service.create(self.alarm)
+        self.service.mark_ringing(self.alarm.id, datetime(2026, 11, 18, 7, 30))
+
+        dismissed_once = self.service.dismiss(self.alarm.id)
+
+        self.assertFalse(dismissed_once.enabled)
+        self.assertIsNone(self.service.runtime_for(self.alarm.id))
+        self.assertEqual(self.store.load(), [dismissed_once])
+
+        recurring = Alarm(
+            id="daily",
+            scheduled_time=time(8, 0),
+            recurrence=Recurrence(RecurrenceKind.DAILY),
+        )
+        self.service.create(recurring)
+        self.service.mark_ringing(recurring.id, datetime(2026, 11, 18, 8, 0))
+        dismissed_recurring = self.service.dismiss(recurring.id)
+
+        self.assertTrue(dismissed_recurring.enabled)
+        self.assertEqual(self.service.get(recurring.id), recurring)
+        self.assertIsNone(self.service.runtime_for(recurring.id))
 
 
 if __name__ == "__main__":

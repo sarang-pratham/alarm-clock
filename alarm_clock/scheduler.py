@@ -4,7 +4,7 @@ from threading import Event
 from typing import Callable
 
 from .models import Alarm, RecurrenceKind
-from .service import AlarmNotFoundError, AlarmService
+from .service import AlarmNotFoundError, AlarmService, OccurrenceState
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +75,11 @@ class Scheduler:
         for alarm in self._service.list_alarms():
             if not alarm.enabled:
                 continue
+            runtime = self._service.runtime_for(alarm.id)
+            if runtime is not None and runtime.state is OccurrenceState.SNOOZED:
+                if runtime.snoozed_until is not None:
+                    occurrences[alarm.id] = ScheduledOccurrence(alarm, runtime.snoozed_until)
+                continue
             previous = self._occurrences.get(alarm.id)
             if previous is not None and previous.alarm == alarm and previous.at <= now:
                 occurrences[alarm.id] = previous
@@ -90,7 +95,7 @@ class Scheduler:
             ScheduledOccurrence(alarm, occurrence)
             for alarm in self._service.list_alarms()
             if alarm.enabled
-            if (occurrence := self._next_unfired_occurrence(alarm, now)) is not None
+            if (occurrence := self._upcoming_for(alarm, now)) is not None
         ]
         return min(candidates, key=lambda item: item.at) if candidates else None
 
@@ -115,6 +120,9 @@ class Scheduler:
 
             self._occurrences.pop(item.alarm.id, None)
             self._fired.add((item.alarm.id, item.at))
+            runtime = self._service.runtime_for(current.id)
+            scheduled_at = runtime.scheduled_at if runtime is not None else item.at
+            self._service.mark_ringing(current.id, scheduled_at)
             try:
                 self._on_trigger(current)
             except Exception:
@@ -138,6 +146,12 @@ class Scheduler:
         while occurrence is not None and (alarm.id, occurrence) in self._fired:
             occurrence = next_occurrence(alarm, occurrence + timedelta(microseconds=1))
         return occurrence
+
+    def _upcoming_for(self, alarm: Alarm, now: datetime) -> datetime | None:
+        runtime = self._service.runtime_for(alarm.id)
+        if runtime is not None and runtime.state is OccurrenceState.SNOOZED:
+            return runtime.snoozed_until
+        return self._next_unfired_occurrence(alarm, now)
 
     def run_forever(self) -> None:
         self._stop_event.clear()

@@ -141,6 +141,22 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(scheduler.run_pending(), [alarm])
 
+    def test_snoozed_occurrence_is_scheduled_and_rings_with_original_alarm(self) -> None:
+        alarm = self.make_alarm("wake", time(7, 1))
+        self.service.create(alarm)
+        scheduler = self.make_scheduler()
+        self.now[0] = datetime(2026, 11, 18, 7, 1)
+        self.assertEqual(scheduler.run_pending(), [alarm])
+
+        snoozed_until = self.service.snooze(alarm.id, self.now[0])
+        scheduler.refresh()
+        self.assertEqual(scheduler.next_upcoming().at, snoozed_until)
+
+        self.now[0] = snoozed_until
+        scheduler.refresh()
+        self.assertEqual(scheduler.run_pending(), [alarm])
+        self.assertEqual(self.triggered, [alarm, alarm])
+
     def test_notification_failure_does_not_stop_other_due_alarms(self) -> None:
         first = self.make_alarm("first", time(7, 0))
         second = self.make_alarm("second", time(7, 0))
